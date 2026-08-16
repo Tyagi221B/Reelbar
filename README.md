@@ -8,28 +8,39 @@ Not an iframe, not a proxy. A real Chrome runs with its window parked out of sig
 
 ## Install
 
-Reelbar isn't on the Marketplace yet, so you build it yourself. It takes about a minute.
+Reelbar isn't on the Marketplace yet. Two ways in — the first needs nothing but VS Code.
 
-**You need first:** [Node.js](https://nodejs.org) 18+, VS Code 1.80+, and a Chromium browser (Chrome, Brave, Edge or Chromium — auto-detected).
+**Requirements:** VS Code 1.80+ and a Chromium browser (Chrome, Brave, Edge or Chromium — auto-detected).
 
-Download the source ([ZIP](https://github.com/Tyagi221B/Reelbar/archive/refs/heads/main.zip) or `git clone`), open a terminal **in that folder**, and run:
+### Option A — download the `.vsix`
+
+1. Grab `reelbar-2.1.0.vsix` from the [latest release](https://github.com/Tyagi221B/Reelbar/releases/latest).
+2. In VS Code: **Extensions** → `···` menu → **Install from VSIX…** → pick the file.
+
+Or from a terminal, in the folder you downloaded it to:
+
+```bash
+code --install-extension reelbar-2.1.0.vsix
+```
+
+### Option B — build it yourself
+
+Needs [Node.js](https://nodejs.org) 18+. Download the source ([ZIP](https://github.com/Tyagi221B/Reelbar/archive/refs/heads/main.zip) or `git clone`), open a terminal **in that folder**, and run:
 
 ```bash
 npm install
 npm run package
 ```
 
-That produces `reelbar-2.0.0.vsix` in the folder. Install it:
+That builds `reelbar-2.1.0.vsix` next to the source. Install it as in Option A.
 
-```bash
-code --install-extension reelbar-2.0.0.vsix
-```
+> The `.vsix` is not committed to the repo, so the source ZIP alone won't contain one — `npm run package` is what builds it.
 
-On Windows, if `code` isn't recognised, use VS Code instead: **Extensions** → `···` menu → **Install from VSIX…** → pick the file.
+### Either way
 
-Then **fully quit and reopen VS Code** (`⌘Q` / close every window — not "Reload Window").
+**Fully quit and reopen VS Code** afterwards (`⌘Q`, or close every window — "Reload Window" is not enough).
 
-> The `.vsix` is not committed to the repo, so downloading the source ZIP alone won't give you one — `npm run package` is what builds it.
+On Windows, `code` on the command line only works if VS Code was added to PATH during setup; if it isn't recognised, use the **Install from VSIX…** menu instead.
 
 **Platform support**
 
