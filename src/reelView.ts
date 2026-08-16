@@ -5,8 +5,12 @@ import * as vscode from "vscode";
 import { ChromeManager, SingletonLockError } from "./chromeManager";
 import { Cdp } from "./cdp";
 
-const LOGIN_URL_RE =
+const LOGIN_URL_INSTAGRAM_RE =
   /\/accounts\/login|\/challenge|\/checkpoint|\/two_factor|\/auth_platform|\/accounts\/suspended/;
+const LOGIN_URL_YTMUSIC_RE =
+  /accounts\.google\.com\/(signin|ServiceLogin|o\/oauth2)|myaccount\.google\.com/;
+const LOGIN_URL_SLACK_RE =
+  /slack\.com\/(sign_?in|workspace-signin|intl\/[^/]+\/sign_?in|get-started)|app\.slack\.com\/(auth|[^/]+\/auth)/;
 
 // Virtual key codes for the non-printable keys Instagram cares about.
 const VK: Record<string, number> = {
@@ -29,6 +33,7 @@ const VK: Record<string, number> = {
 function cfg(): vscode.WorkspaceConfiguration {
   return vscode.workspace.getConfiguration("reelbar");
 }
+
 
 // Bail out of a page action when the user is actually typing (comment box,
 // search field) so Space still types a space and arrows still move the caret.
@@ -87,6 +92,12 @@ export const TOGGLE_PLAY_JS = `(() => {${TYPING_GUARD}
   return "pause";
 })()`;
 
+// Just the typing check, for panels where the page owns play/pause and we
+// only need to know whether Space belongs to a focused text field.
+export const IS_TYPING_JS = `(() => {${TYPING_GUARD}
+  return "page";
+})()`;
+
 interface ViewDims {
   cssW: number;
   cssH: number;
@@ -101,7 +112,8 @@ const RESIZE_THROTTLE_MS = 250;
 const MIN_SANE_DIM = 50;
 
 export class ReelViewProvider implements vscode.WebviewViewProvider {
-  static readonly viewId = "reelbar.view";
+  readonly viewId: string;
+  readonly source: string;
 
   private context: vscode.ExtensionContext;
   private chrome: ChromeManager;
@@ -120,11 +132,29 @@ export class ReelViewProvider implements vscode.WebviewViewProvider {
   private navKeys = new Set<string>(); // arrow keydowns we consumed, awaiting keyup
   private disposables: Array<() => void> = [];
 
-  constructor(context: vscode.ExtensionContext) {
+  constructor(context: vscode.ExtensionContext, viewId: string, source: string) {
     this.context = context;
-    this.chrome = new ChromeManager(context, {
-      onGone: () => this.onChromeGone(),
-    });
+    this.viewId = viewId;
+    this.source = source;
+    this.chrome = this.makeChrome();
+  }
+
+  private makeChrome(): ChromeManager {
+    // Instagram keeps the pre-multi-panel "profile" subdir so existing users
+    // stay logged in across the upgrade; new panels get their own.
+    const profileSubdir = this.source === "instagram" ? "profile" : `profile-${this.source}`;
+    return new ChromeManager(
+      this.context,
+      { onGone: () => this.onChromeGone() },
+      profileSubdir,
+      this.sourceUrl()
+    );
+  }
+
+  private sourceUrl(): string {
+    if (this.source === "ytmusic") return "https://music.youtube.com/";
+    if (this.source === "slack") return "https://app.slack.com/";
+    return cfg().get<string>("url", "https://www.instagram.com/");
   }
 
   get chromeManager(): ChromeManager {
@@ -203,9 +233,21 @@ export class ReelViewProvider implements vscode.WebviewViewProvider {
         break;
       case "text":
         if (this.cdp && this.sessionId && typeof m.text === "string") {
-          // Space is play/pause unless the user is typing, in which case the
-          // page action reports back and we insert the space as normal.
-          if (m.text === " " && (await this.pageAction(TOGGLE_PLAY_JS)) !== "typing") break;
+          if (m.text === " ") {
+            if (this.source === "instagram") {
+              // Instagram: toggle play/pause via the video element directly.
+              if ((await this.pageAction(TOGGLE_PLAY_JS)) !== "typing") break;
+            } else if ((await this.pageAction(IS_TYPING_JS)) !== "typing") {
+              // YT Music and Slack bind space via keydown — dispatch as a real
+              // key event instead of inserting a text character. When the
+              // focus is in a text field (search box, message composer), fall
+              // through to insertText so the space actually types.
+              const spaceKey = { key: " ", code: "Space", windowsVirtualKeyCode: 32, nativeVirtualKeyCode: 32 };
+              await this.cdp.send("Input.dispatchKeyEvent", { type: "keyDown", ...spaceKey }, this.sessionId).catch(() => {});
+              await this.cdp.send("Input.dispatchKeyEvent", { type: "keyUp", ...spaceKey }, this.sessionId).catch(() => {});
+              break;
+            }
+          }
           await this.cdp
             .send("Input.insertText", { text: m.text }, this.sessionId)
             .catch(() => {});
@@ -284,6 +326,62 @@ export class ReelViewProvider implements vscode.WebviewViewProvider {
     this.disposables = [];
 
     await cdp.send("Page.enable", {}, sessionId);
+
+    // Slack: three-layer defence so workspace navigation stays in the panel.
+    if (this.source === "slack") {
+      const slackScript = `(function(){
+        if (window.__reelbarSlack) return;
+        window.__reelbarSlack = true;
+        // 1. Intercept window.open — Slack calls this for workspace navigation
+        const _open = window.open;
+        window.open = function(url) {
+          if (typeof url === "string") {
+            if (url.startsWith("slack://")) return null;
+            if (url.startsWith("https://app.slack.com/")) { location.href = url; return null; }
+          }
+          return _open.apply(this, arguments);
+        };
+        // 2. Intercept <a target="_blank"> clicks
+        document.addEventListener("click", function(e) {
+          const a = e.target && e.target.closest && e.target.closest("a");
+          if (a && a.target === "_blank" && a.href && a.href.startsWith("https://app.slack.com/")) {
+            e.preventDefault(); e.stopPropagation(); location.href = a.href;
+          }
+        }, true);
+      })();`;
+
+      // Inject into the CURRENT page (addScriptToEvaluateOnNewDocument only
+      // runs on future page loads — the workspace picker is already loaded).
+      await cdp.send("Runtime.evaluate", {
+        expression: slackScript, returnByValue: false,
+      }, sessionId).catch(() => {});
+
+      // Also inject into every future page navigation.
+      await cdp.send("Page.addScriptToEvaluateOnNewDocument", {
+        source: slackScript,
+      }, sessionId).catch(() => {});
+
+      // 3. Browser-level fallback: if a new app.slack.com/client tab is created
+      // anyway (e.g. via browser-internal navigation we can't intercept in JS),
+      // pull its URL into our main tab and close the orphan.
+      await cdp.send("Target.setDiscoverTargets", { discover: true }).catch(() => {});
+      const mainTargetId = this.chrome.pageTargetId;
+      const pullNewSlackTab = async (info: any) => {
+        if (!info || info.type !== "page" || info.targetId === mainTargetId) return;
+        if (!info.url.startsWith("https://app.slack.com/client/")) return;
+        const sid = this.sessionId;
+        if (!sid) return;
+        await cdp.send("Page.navigate", { url: info.url }, sid).catch(() => {});
+        await cdp.send("Target.closeTarget", { targetId: info.targetId }).catch(() => {});
+      };
+      this.disposables.push(
+        cdp.on("Target.targetCreated",     (p) => void pullNewSlackTab(p?.targetInfo))
+      );
+      this.disposables.push(
+        cdp.on("Target.targetInfoChanged", (p) => void pullNewSlackTab(p?.targetInfo))
+      );
+    }
+
     // The page must believe it's focused while parked offscreen, or videos
     // pause and hover UI never appears.
     await cdp
@@ -294,7 +392,8 @@ export class ReelViewProvider implements vscode.WebviewViewProvider {
     // serves its mobile UI, where reels fill the viewport edge to edge.
     // Pinned here so a mid-session config toggle can't pair phone metrics
     // with a desktop UA (or vice versa) on the next resize.
-    const wantMobile = cfg().get<boolean>("mobileUI", false);
+    // YT Music and Slack are desktop-first; mobileUI is Instagram-only.
+    const wantMobile = this.source === "instagram" && cfg().get<boolean>("mobileUI", false);
     this.chrome.setSessionMobile(wantMobile);
     if (wantMobile) {
       const ua = {
@@ -356,8 +455,16 @@ export class ReelViewProvider implements vscode.WebviewViewProvider {
         const frame = params.frame;
         if (frame?.parentId) return; // main frame only
         const url: string = frame?.url || "";
-        if (LOGIN_URL_RE.test(url)) {
-          this.postState("loginNeeded");
+        const loginRe = this.source === "ytmusic" ? LOGIN_URL_YTMUSIC_RE
+          : this.source === "slack" ? LOGIN_URL_SLACK_RE
+          : LOGIN_URL_INSTAGRAM_RE;
+        if (loginRe.test(url)) {
+          const detail = this.source === "ytmusic"
+            ? "YouTube Music wants you to log in with your Google account. Do it in a real browser window — it only takes once."
+            : this.source === "slack"
+            ? "Slack wants you to sign in to your workspace. Do it in a real browser window — it only takes once."
+            : "Instagram wants you to log in or verify. Do it in a real browser window — it only takes once.";
+          this.postState("loginNeeded", detail);
         } else if (!this.chrome.isShown) {
           this.postState("live");
         }
@@ -551,8 +658,9 @@ export class ReelViewProvider implements vscode.WebviewViewProvider {
   private async dispatchKey(m: any): Promise<void> {
     if (!this.cdp || !this.sessionId) return;
     const code = m.code || m.key;
-    // Reel navigation, handled here because the page binds nothing to arrows.
-    if (code === "ArrowDown" || code === "ArrowUp") {
+    // Reel scroll — Instagram only: the page binds nothing to arrows so we
+    // step a full reel. YT Music handles arrows natively (seek / volume).
+    if (this.source === "instagram" && (code === "ArrowDown" || code === "ArrowUp")) {
       if (this.navKeys.has(code)) {
         if (m.kind === "up") this.navKeys.delete(code);
         return; // swallow the matching keyup of a keydown we consumed
@@ -683,7 +791,7 @@ export class ReelViewProvider implements vscode.WebviewViewProvider {
     this.cdp = null;
     this.sessionId = null;
     // ChromeManager marked itself disposed; build a fresh one for next time.
-    this.chrome = new ChromeManager(this.context, { onGone: () => this.onChromeGone() });
+    this.chrome = this.makeChrome();
     this.postState("chromeDead");
   }
 

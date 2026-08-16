@@ -54,6 +54,7 @@ function cfg(): vscode.WorkspaceConfiguration {
   return vscode.workspace.getConfiguration("reelbar");
 }
 
+
 export function findBrowser(): string | null {
   const custom = (cfg().get<string>("browserPath") || "").trim();
   if (custom) return fs.existsSync(custom) ? custom : null;
@@ -107,6 +108,8 @@ export interface ChromeEvents {
 export class ChromeManager {
   private context: vscode.ExtensionContext;
   private events: ChromeEvents;
+  private readonly profileSubdir: string;
+  private readonly fixedStartUrl: string | null;
   private proc: ChildProcess | null = null;
   private cdp: Cdp | null = null;
   private windowId: number | null = null;
@@ -122,9 +125,22 @@ export class ChromeManager {
   private sessionMobile = false;
   private minimizedPark = false; // sliver park failed; window is minimized
 
-  constructor(context: vscode.ExtensionContext, events: ChromeEvents) {
+  constructor(
+    context: vscode.ExtensionContext,
+    events: ChromeEvents,
+    profileSubdir = "profile",
+    startUrl?: string
+  ) {
     this.context = context;
     this.events = events;
+    this.profileSubdir = profileSubdir;
+    this.fixedStartUrl = startUrl ?? null;
+  }
+
+  // A panel passes its fixed URL; without one (legacy callers, tests) fall
+  // back to the reelbar.url setting, read at launch time as before.
+  private get startUrl(): string {
+    return this.fixedStartUrl ?? cfg().get<string>("url", "https://www.instagram.com/");
   }
 
   get connection(): Cdp | null {
@@ -156,7 +172,7 @@ export class ChromeManager {
   }
 
   private get profileDir(): string {
-    return path.join(this.context.globalStorageUri.fsPath, "profile");
+    return path.join(this.context.globalStorageUri.fsPath, this.profileSubdir);
   }
 
   // Connect to a live Chrome on our profile, or spawn one. Returns the
@@ -224,7 +240,14 @@ export class ChromeManager {
       /* ignore */
     }
 
-    const url = cfg().get<string>("url", "https://www.instagram.com/");
+    // For Slack: write Chrome preferences that silently block slack:// protocol
+    // links before the first launch so workspace-switching never triggers the
+    // invisible "Open in Slack app?" dialog that would freeze the parked window.
+    if (this.startUrl.includes("slack.com")) {
+      this.writeBlockedSchemes(["slack"]);
+    }
+
+    const url = this.startUrl;
     const args = [
       "--remote-debugging-port=0",
       `--user-data-dir=${this.profileDir}`,
@@ -281,8 +304,10 @@ export class ChromeManager {
     this.windowId = null;
     this.lastAppliedViewport = null; // new window/session: no override applied yet
     const { targetInfos } = await this.cdp.send("Target.getTargets");
+    let hostname = "instagram.com";
+    try { hostname = new URL(this.startUrl).hostname; } catch { /* fallback */ }
     let page = (targetInfos as any[]).find(
-      (t) => t.type === "page" && t.url.includes("instagram.com")
+      (t) => t.type === "page" && t.url.includes(hostname)
     );
     if (!page) {
       page = (targetInfos as any[]).find(
@@ -293,8 +318,7 @@ export class ChromeManager {
     if (page) {
       targetId = page.targetId;
     } else {
-      const url = cfg().get<string>("url", "https://www.instagram.com/");
-      const created = await this.cdp.send("Target.createTarget", { url });
+      const created = await this.cdp.send("Target.createTarget", { url: this.startUrl });
       targetId = created.targetId;
     }
     this.targetId = targetId;
@@ -527,6 +551,27 @@ export class ChromeManager {
     const aspectHeight = Math.max(MIN_PHONE_HEIGHT, Math.round((PHONE_WIDTH * h) / w));
     const height = mobile ? Math.min(cap, aspectHeight) : h;
     return { width, height, mobile };
+  }
+
+  // Write Chrome's Default/Preferences file to silently block the given URL
+  // schemes from triggering external-app dialogs. Must be called before Chrome
+  // starts; on a fresh profile Chrome accepts the file as-is (no prior MAC).
+  private writeBlockedSchemes(schemes: string[]): void {
+    const defaultDir = path.join(this.profileDir, "Default");
+    fs.mkdirSync(defaultDir, { recursive: true });
+    const prefsPath = path.join(defaultDir, "Preferences");
+    let prefs: any = {};
+    try {
+      prefs = JSON.parse(fs.readFileSync(prefsPath, "utf8"));
+    } catch { /* new profile — start empty */ }
+    prefs.protocol_handler = prefs.protocol_handler || {};
+    prefs.protocol_handler.excluded_schemes = prefs.protocol_handler.excluded_schemes || {};
+    for (const s of schemes) {
+      prefs.protocol_handler.excluded_schemes[s] = true;
+    }
+    try {
+      fs.writeFileSync(prefsPath, JSON.stringify(prefs));
+    } catch { /* best-effort */ }
   }
 
   // The real window must look normal when shown for login — drop any
